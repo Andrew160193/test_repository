@@ -1,0 +1,611 @@
+CREATE OR REPLACE PACKAGE PKG_ADMIN_REG_TICKET_EVENTS AS
+
+
+--Этот пакет предназначен для отчетности,
+--которая выгружается в редактор.
+--ЗАЯВКА ZHKKH-761
+
+-------------------------------------------------------------
+--            ЖУРНАЛ СОБЫТИЙ ПО ОБРАЩЕНИЯМ                 --
+-------------------------------------------------------------
+
+  CURSOR cur_ticket_events (
+        I_INIT_TIME TIMESTAMP
+      , I_FINISH_TIME TIMESTAMP
+      , I_LOGIN NUMBER
+      , I_TICKET NUMBER
+      , I_EMAIL VARCHAR2
+      , I_OGRN VARCHAR2
+      , I_REGION NUMBER
+  )
+IS
+WITH
+GIS_ZHKH AS (SELECT * FROM DUAL),
+ACTIONS_LOGS AS
+(SELECT
+   ACL.ID_ACTION,
+   ACL.LOGGABLE_ID as LOG_ID --НОМЕР ТИКЕТА
+ , LAG(ACL.ID_ACTION,1) over (ORDER BY ACL.LOGGABLE_ID, ACL.CREATED_AT) AS PREV_ID_ACTION
+ , LAG(ACL.LOGGABLE_ID,1) over (ORDER BY ACL.LOGGABLE_ID, ACL.CREATED_AT) AS PREV_LOG_ID
+ , LAG(ACL.CREATED_AT,1) over (ORDER BY ACL.LOGGABLE_ID, ACL.CREATED_AT) AS START_TIME
+ , LAG(ACT.CODE,1) over (ORDER BY ACL.LOGGABLE_ID, ACL.CREATED_AT) AS START_CODE
+ , ACL.CREATED_AT AS FINISH_TIME
+ , ACT.CODE AS FINISH_CODE
+ , ACL.FID_USER AS FID_USER
+ FROM
+   USER_ACTIONS_LOG ACL
+   JOIN USER_ACTION_TYPES ACT
+    ON ACT.ID_TYPE = ACL.FID_TYPE
+   JOIN TICKETS TCT
+    ON TCT.ID_TICKET = ACL.LOGGABLE_ID
+ WHERE
+       LOGGABLE_TYPE = 'TICKETS'
+   AND ACT.CODE IN ('ticket-assigned','ticket-new-answer-sent','ticket-no-answer','ticket-created','ticket-blocked','ticket-unblocked')
+   AND (ACL.CREATED_AT >= I_INIT_TIME OR I_INIT_TIME IS NULL) AND (ACL.CREATED_AT < I_FINISH_TIME + interval '30' minute OR I_FINISH_TIME IS NULL)
+   AND (ACL.LOGGABLE_ID = I_TICKET OR I_TICKET IS NULL)
+   AND (ACL.FID_USER = I_LOGIN OR I_LOGIN IS NULL )
+   AND (TCT.COMPANY_OGRN = I_OGRN OR I_OGRN IS NULL)
+   AND (TCT.FID_COMPANY_REGION = I_REGION OR I_REGION IS NULL)
+)
+, BIND_MESSAGES AS
+(SELECT
+   RELATIONABLE_TYPE
+ , RELATIONABLE_ID
+ , FID_ACTION
+ , CREATED_AT
+  FROM
+ USER_ACTION_RELATIONS ACR
+ WHERE
+   (ACR.CREATED_AT >= I_INIT_TIME OR I_INIT_TIME IS NULL) AND (ACR.CREATED_AT < I_FINISH_TIME + interval '30' minute OR I_FINISH_TIME IS NULL)
+   AND ACR.RELATIONABLE_TYPE = 'MAIL_MESSAGES'
+)
+, ACTIONS_LOGS_2 AS
+(SELECT DISTINCT--Двойные события
+   ACL.ID_ACTION AS ID_ACTION
+ , ACL.LOG_ID AS LOG_ID --НОМЕР ТИКЕТА
+ , ACL.START_TIME AS START_TIME
+ , ACL.START_CODE AS START_CODE
+ , ACL.FINISH_TIME AS FINISH_TIME
+ , ACL.FINISH_CODE AS FINISH_CODE
+ , ACL.FID_USER AS FID_USER
+ , MAX(LG.ID_LOG) AS ID_LOG
+ , ACL.PREV_ID_ACTION AS PREV_ID_ACTION
+ , BMS.RELATIONABLE_ID AS ID_MAIL --ПРИВЯЗАННОЕ ПИСЬМО
+ FROM
+  ACTIONS_LOGS ACL
+ LEFT JOIN USER_ACTION_RELATIONS ACR
+  ON ACR.FID_ACTION = ACL.ID_ACTION
+ LEFT JOIN LOGS LG
+  ON LG.ID_LOG = ACR.RELATIONABLE_ID AND ACR.RELATIONABLE_TYPE = 'LOGS'
+ LEFT JOIN BIND_MESSAGES BMS ON BMS.FID_ACTION = ACL.PREV_ID_ACTION
+ WHERE
+        (ACL.START_TIME >= I_INIT_TIME OR I_INIT_TIME IS NULL) AND (ACL.START_TIME < I_FINISH_TIME OR I_FINISH_TIME IS NULL)
+   AND    ACL.LOG_ID = ACL.PREV_LOG_ID
+   AND ((ACL.START_CODE = 'ticket-assigned' and ACL.FINISH_CODE IN ('ticket-new-answer-sent','ticket-no-answer'))
+     OR (ACL.START_CODE IN ('ticket-created') and ACL.FINISH_CODE = 'ticket-unblocked')
+     OR (ACL.START_CODE IN ('ticket-blocked') and ACL.FINISH_CODE = 'ticket-unblocked')
+       )
+  GROUP BY ACL.ID_ACTION,ACL.LOG_ID,
+           ACL.START_TIME,ACL.START_CODE,
+           ACL.FINISH_TIME,ACL.FINISH_CODE,
+           ACL.FID_USER,ACL.PREV_ID_ACTION,
+           BMS.RELATIONABLE_ID
+  UNION
+  SELECT --Одиночные события
+   ACL.ID_ACTION AS ID_ACTION
+ , ACL.LOGGABLE_ID as LOG_ID --НОМЕР ТИКЕТА
+ , ACL.CREATED_AT AS START_TIME
+ , ACT.CODE AS START_CODE
+ , NULL AS FINISH_TIME
+ , NULL AS FINISH_CODE
+ , ACL.FID_USER AS FID_USER
+ , MAX(LG.ID_LOG) AS ID_LOG
+ , NULL AS PREV_ID_ACTION
+ , NULL AS ID_MAIL
+ FROM
+   USER_ACTIONS_LOG ACL
+   JOIN USER_ACTION_TYPES ACT
+    ON ACT.ID_TYPE = ACL.FID_TYPE
+   JOIN TICKETS TCT
+    ON TCT.ID_TICKET = ACL.LOGGABLE_ID
+   LEFT JOIN USER_ACTION_RELATIONS ACR
+    ON ACR.FID_ACTION = ACL.ID_ACTION
+   LEFT JOIN LOGS LG
+    ON LG.ID_LOG = ACR.RELATIONABLE_ID AND ACR.RELATIONABLE_TYPE = 'LOGS'
+ WHERE
+       ACL.LOGGABLE_TYPE = 'TICKETS'
+   AND ACT.CODE IN ('ticket-closed','sent-answer','ticket-mark-as-spam', 'ticket-prolong-notification')
+   AND (ACL.CREATED_AT >= I_INIT_TIME OR I_INIT_TIME IS NULL) AND (ACL.CREATED_AT < I_FINISH_TIME OR I_FINISH_TIME IS NULL)
+   AND (ACL.LOGGABLE_ID = I_TICKET OR I_TICKET IS NULL)
+   AND (ACL.FID_USER = I_LOGIN OR I_LOGIN IS NULL )
+   AND (TCT.COMPANY_OGRN = I_OGRN OR I_OGRN IS NULL)
+   AND (TCT.FID_COMPANY_REGION = I_REGION OR I_REGION IS NULL)
+  GROUP BY ACL.ID_ACTION, ACL.LOGGABLE_ID, ACL.CREATED_AT, ACT.CODE, ACL.FID_USER
+
+--   UNION ALL --Уже не нужно
+--  SELECT --Только изменения
+--   ACL.ID_ACTION AS ID_ACTION,
+--   ACL.LOGGABLE_ID as LOG_ID --НОМЕР ТИКЕТА
+-- , ACL.CREATED_AT AS START_TIME
+-- , ACT.CODE AS START_CODE
+-- , NULL AS FINISH_TIME
+-- , NULL AS FINISH_CODE
+-- , ACL.FID_USER AS FID_USER
+-- , LG.ID_LOG AS NEW_VALUE
+-- FROM
+--   USER_ACTIONS_LOG ACL
+--   JOIN USER_ACTION_TYPES ACT
+--    ON ACT.ID_TYPE = ACL.FID_TYPE
+--   LEFT JOIN USER_ACTION_RELATIONS ACR
+--    ON ACR.FID_ACTION = ACL.ID_ACTION
+--   LEFT JOIN LOGS LG
+--    ON LG.ID_LOG = ACR.RELATIONABLE_ID AND ACR.RELATIONABLE_TYPE = 'LOGS'
+-- WHERE
+--       ACL.LOGGABLE_TYPE = 'TICKETS'
+--   AND ACT.CODE = 'ticket-update'
+----   AND ACL.CREATED_AT >= I_INIT_TIME AND ACL.CREATED_AT < I_FINISH_TIME
+----   AND (ACL.LOGGABLE_ID = I_TICKET OR I_TICKET IS NULL)
+----   AND (ACL.FID_USER = I_LOGIN OR I_LOGIN IS NULL )
+-- ORDER BY START_TIME
+
+)
+
+, FIRST_MESSAGES AS --МЫ ДОЛЖНЫ БРАТЬ ТО ПИСЬМО, КОТОРОЕ ИНИЦИИРОВАЛО ОБРАЩЕНИЕ
+ (SELECT
+   TCK.ID_TICKET AS ID_TICKET
+ , MIN(MSG.ID_MESSAGE) AS FID_MESSAGE
+ FROM MAIL_MESSAGES MSG --ЛОГ ПИСЕМ
+ JOIN TICKETS TCK --ОБРАЩЕНИЯ
+   ON TCK.ID_TICKET = MSG.FID_TICKET
+ JOIN ACTIONS_LOGS_2 ACL
+  ON ACL.LOG_ID = TCK.ID_TICKET
+ GROUP BY TCK.ID_TICKET
+ )
+, ALL_MESSAGES AS --МЫ ДОЛЖНЫ БРАТЬ ТО ПИСЬМО, КОТОРОЕ ИНИЦИИРОВАЛО ОБРАЩЕНИЕ
+ (SELECT
+   ID_TICKET
+ , rtrim ( xmlcast ( xmlagg ( xmlelement ( "a", ID_MESSAGE ||', ' ) ORDER BY ID_MESSAGE ASC ) AS VARCHAR2(4000 CHAR) ), ', ' ) AS FID_MESSAGES
+ --, LISTAGG(MSG.ID_MESSAGE, ', ') WITHIN GROUP ( ORDER BY MSG.ID_MESSAGE) AS FID_MESSAGES
+ FROM (
+  select
+      ID_TICKET,
+      ID_MESSAGE,
+      ROW_NUMBER()OVER(PARTITION BY ID_TICKET ORDER BY ID_MESSAGE DESC)   AS RN
+
+      from (
+    SELECT DISTINCT
+      TCK.ID_TICKET AS ID_TICKET,
+      MSG.ID_MESSAGE/*,
+      ROW_NUMBER()OVER(PARTITION BY TCK.ID_TICKET ORDER BY MSG.ID_MESSAGE DESC)   AS RN*/
+       FROM MAIL_MESSAGES MSG --ЛОГ ПИСЕМ
+       JOIN TICKETS TCK --ОБРАЩЕНИЯ
+         ON TCK.ID_TICKET = MSG.FID_TICKET
+       JOIN ACTIONS_LOGS_2 ACL
+        ON ACL.LOG_ID = TCK.ID_TICKET
+
+    )
+  )
+  where RN<100
+ GROUP BY ID_TICKET
+ )
+
+, MAIL_ADRESSES AS
+ (SELECT
+     FID_MESSAGE
+ -- ,   LISTAGG(DECODE(NAME_TYPE,'from',MAIL_ADDRESS,NULL),'; ') WITHIN GROUP (order by MAIL_ADDRESS) AS FROM_MAIL
+--  ,  LISTAGG(DECODE(NAME_TYPE,'receiver',MAIL_ADDRESS,NULL),'; ') WITHIN GROUP (order by MAIL_ADDRESS) AS RECEIVER_MAIL
+ -- ,  LISTAGG(DECODE(NAME_TYPE,'copy',MAIL_ADDRESS,NULL),'; ') WITHIN GROUP (order by MAIL_ADDRESS) AS COPY_MAIL
+
+  ,  ltrim ( rtrim ( xmlcast ( xmlagg ( xmlelement ( "a", DECODE(NAME_TYPE,'from',MAIL_ADDRESS,NULL) ||', ' ) /*ORDER BY MAIL_ADDRESS ASC*/ ) AS VARCHAR2(4000 CHAR) ), ', ' ), ', ' ) AS FROM_MAIL
+  ,  ltrim ( rtrim ( xmlcast ( xmlagg ( xmlelement ( "a", DECODE(NAME_TYPE,'receiver',MAIL_ADDRESS,NULL) ||', ' ) /*ORDER BY MAIL_ADDRESS ASC*/ ) AS VARCHAR2(4000 CHAR) ), ', ' ), ', ' ) AS RECEIVER_MAIL
+  ,  ltrim ( rtrim ( xmlcast ( xmlagg ( xmlelement ( "a", DECODE(NAME_TYPE,'copy',MAIL_ADDRESS,NULL) ||', ' ) /*ORDER BY MAIL_ADDRESS ASC */) AS VARCHAR2(4000 CHAR) ), ', ' ), ', ' ) AS COPY_MAIL
+    FROM(
+     select
+          FID_MESSAGE
+        , MAIL_ADDRESS
+        , NAME_TYPE
+        , ROW_NUMBER()OVER(PARTITION BY FID_MESSAGE, NAME_TYPE ORDER BY ID_ADDRESS DESC)   AS RN
+        from
+      (
+          SELECT DISTINCT
+            ADR.FID_MESSAGE AS FID_MESSAGE
+          , ADR.MAIL_ADDRESS AS MAIL_ADDRESS
+          , ADT.CODE AS NAME_TYPE
+          , ADR.ID_ADDRESS
+          FROM
+          MAIL_ADDRESSES ADR
+          JOIN MAIL_D_ADDRESSES_TYPE ADT
+           ON ADT.ID_ADDRESS_TYPE = ADR.FID_ADDRESS_TYPE
+          JOIN MAIL_MESSAGES MSG
+           ON MSG.ID_MESSAGE = ADR.FID_MESSAGE
+          JOIN TICKETS TCK --ОБРАЩЕНИЯ
+           ON TCK.ID_TICKET = MSG.FID_TICKET
+          JOIN ACTIONS_LOGS_2 ACL
+           ON ACL.LOG_ID = TCK.ID_TICKET
+          WHERE (MAIL_ADDRESS = I_EMAIL OR I_EMAIL IS NULL)
+         )
+       )
+       WHERE NAME_TYPE IN ('from','receiver','copy')
+         and RN<100
+       GROUP BY FID_MESSAGE
+ )
+, ALL_TICKETS_TASKS AS--достает список задач в JIRA контакта
+    (
+    SELECT FID_ACTION,
+           MAX(DECODE(seq,1,TASK_CODE,NULL))  AS TASK1
+        ,  MAX(DECODE(seq,2,TASK_CODE,NULL))  AS TASK2
+        ,  MAX(DECODE(seq,3,TASK_CODE,NULL))  AS TASK3
+        ,  MAX(DECODE(seq,4,TASK_CODE,NULL))  AS TASK4
+        ,  MAX(DECODE(seq,5,TASK_CODE,NULL))  AS TASK5
+        ,  MAX(DECODE(seq,6,TASK_CODE,NULL))  AS TASK6
+        ,  MAX(DECODE(seq,7,TASK_CODE,NULL))  AS TASK7
+        ,  MAX(DECODE(seq,8,TASK_CODE,NULL))  AS TASK8
+        ,  MAX(DECODE(seq,9,TASK_CODE,NULL))  AS TASK9
+        ,  MAX(DECODE(seq,10,TASK_CODE,NULL)) AS TASK10
+    FROM
+      (SELECT
+          FID_ACTION
+        , TASK_CODE
+        , ROW_NUMBER()
+       OVER
+          (PARTITION BY
+                FID_ACTION
+           ORDER BY ID_TASK ASC NULLS LAST) seq
+          FROM
+          (
+          SELECT
+            DISTINCT
+              ACR.FID_ACTION AS FID_ACTION
+            , TTS.TASK_CODE AS TASK_CODE
+            , TTS.ID_TASK
+                 FROM TICKETS_TASKS TTS
+                 JOIN USER_ACTION_RELATIONS ACR
+                  ON ACR.RELATIONABLE_ID = TTS.ID_TASK AND ACR.RELATIONABLE_TYPE = 'TICKETS_TASKS'
+                 JOIN TICKETS TCK
+                  ON TCK.ID_TICKET = TTS.FID_TICKET
+                 JOIN ACTIONS_LOGS_2 ACL
+                  ON ACL.LOG_ID = TCK.ID_TICKET
+
+
+           )
+       )
+
+       WHERE seq <= 10
+       GROUP BY FID_ACTION
+
+   )
+, ALL_COMPANY_TYPES AS (
+ SELECT
+   ID_TICKET
+ --, LISTAGG(CTP.NAME,', ') WITHIN GROUP (ORDER BY HCT.ID_HAS) AS COMPANY_TYPES
+
+   , rtrim ( xmlcast ( xmlagg ( xmlelement ( "a", NAME ||', ' ) ORDER BY ID_HAS ASC ) AS VARCHAR2(4000 CHAR) ), ', ' ) AS COMPANY_TYPES
+  FROM
+  (
+   SELECT DISTINCT
+     HCT.FID_TICKET AS ID_TICKET,
+     CTP.NAME,
+     HCT.ID_HAS
+      FROM
+      TICKETS_HAS_CMP_TPS HCT
+      JOIN TICKETS_D_COMPANY_TYPES CTP
+       ON CTP.ID_COMPANY_TYPE = HCT.FID_COMPANY_TYPE
+      JOIN TICKETS TCK
+        ON TCK.ID_TICKET = HCT.FID_TICKET
+       JOIN ACTIONS_LOGS_2 ACL
+        ON ACL.LOG_ID = TCK.ID_TICKET
+
+  )
+   GROUP BY ID_TICKET
+  )
+, GET_WIKI_SUBSTANCES AS ( --Выбранные шаблоны ответов --ТУТ НАДО БОЛЕЕ ИСКУСНО ОГРАНИЧИТЬ ВЫБОРКУ
+   SELECT
+    FID_ACTION,
+    dbms_lob.substr (
+                      rtrim ( xmlcast ( xmlagg ( xmlelement ( "a", SUBSTANCE_NAME ||'; ' ) ORDER BY ID_ANSWER ASC ) AS VARCHAR2(4000 CHAR) ), '; ' ),
+                    2000, 1) AS SUBSTANCE_NAME
+    FROM (
+          SELECT DISTINCT ACR.FID_ACTION, WAN.ID_ANSWER, WSB.SUBSTANCE_NAME
+          FROM USER_ACTION_RELATIONS ACR
+          JOIN WIKI_ANSWER WAN
+           ON WAN.ID_ANSWER = ACR.RELATIONABLE_ID
+          JOIN WIKI_D_SUBSTANCE WSB
+           ON WSB.ID_SUBSTANCE = WAN.FID_SUBSTANCE
+          where ACR.RELATIONABLE_TYPE = 'WIKI_ANSWER'
+            AND (ACR.CREATED_AT >= I_INIT_TIME OR I_INIT_TIME IS NULL) AND (ACR.CREATED_AT < I_FINISH_TIME + interval '30' minute OR I_FINISH_TIME IS NULL)
+        )
+  GROUP BY FID_ACTION
+  )
+, OUT_CALL_RESULTS AS
+(
+SELECT
+   FID_TICKET
+ , MAX(DECODE(seq,1,RESULT_NAME,NULL)) AS CALL_RESULT_1
+ , MAX(DECODE(seq,2,RESULT_NAME,NULL)) AS CALL_RESULT_2
+ , MAX(DECODE(seq,3,RESULT_NAME,NULL)) AS CALL_RESULT_3
+ , MAX(NEXT_CALL_TIME) AS NEXT_CALL_TIME
+
+ FROM (
+SELECT
+   CD.FID_TICKET
+,  RES.NAME AS RESULT_NAME
+,  CD.NEXT_CALL_TIME
+, ROW_NUMBER()
+       OVER
+          (PARTITION BY
+                CD.FID_TICKET
+           ORDER BY CD.ID_OUT_CALL_DATA ASC NULLS LAST) seq
+FROM
+OUT_CALL_DATA CD
+JOIN CORE_CALLS CL
+ ON CL.ID_CALL = CD.FID_CALL
+JOIN CORE_CALLS_RESULTS RES
+ ON RES.ID_RESULT = CL.FID_RESULT
+JOIN ACTIONS_LOGS_2 ACL
+ ON ACL.LOG_ID = CL.FID_RESULT
+)
+ WHERE seq <= 3
+ GROUP BY FID_TICKET
+)
+
+  SELECT
+  ACL.ID_ACTION,
+     ACL.LOG_ID AS ID_TICKET --НОМЕР ТИКЕТА
+   , (CASE
+      WHEN ACL.START_CODE IN ('ticket-register','sent-answer','ticket-update','ticket-mark-as-spam','ticket-closed', 'ticket-prolong-notification')
+      THEN 'Действие'
+      ELSE 'Событие'
+      END) AS RECORD_TYPE --Тип записи
+   , ACT_1.NAME AS START_NAME --Начало события/действия
+   , TO_CHAR(ACL.START_TIME,'dd.mm.yyyy hh24:mi') AS START_TIME --Дата и время начала
+   , ACT_2.NAME AS FINISH_NAME --Окончание события
+   , TO_CHAR(ACL.FINISH_TIME,'dd.mm.yyyy hh24:mi') AS FINISH_TIME --Дата и время окончания
+   , REPLACE(TRIM(TO_CHAR(ROUND(NAUCRM.intervaltosec(ACL.FINISH_TIME - ACL.START_TIME)/60,2),'9990D99')),'.',',') AS PROCESSING_TIME --Длительность события, мин
+   , JII.KEY AS JIRA_INCOMING_ISSUE--Создано на основании заявки в JIRA
+   ,  FM.FID_MESSAGE AS ID_FIRST_MESSAGE --ID FIRST MESSAGE
+   , (CASE
+       WHEN ACL.START_CODE IN ('ticket-register') OR ACR_2.ID_RELATION IS NOT NULL
+       THEN FM.FID_MESSAGE
+--       WHEN ACL.START_CODE IN ('ticket-assigned')
+--       THEN ACL.ID_MAIL
+       ELSE NULL
+      END) AS ID_MESSAGE --Привязано письмо
+   , (CASE
+       WHEN ACL.START_CODE IN ('ticket-created','ticket-assigned')
+       THEN ALM.FID_MESSAGES
+       ELSE NULL
+      END) AS ALL_MESSAGES --Привязано письмо (ВСЕ ПРИВЯЗАННЫЕ ПИСЬМА)
+   , TO_CHAR(MSG.RECEIVING_TIME,'dd.mm.yyyy hh24:mi') AS SUPPORT_TIME --Дата и время поступления
+   , MAD.FROM_MAIL AS FROM_MAIL --E-mail, от кого
+   , MAD.RECEIVER_MAIL AS RECEIVER_MAIL --E-mail, кому
+   , MAD.COPY_MAIL AS COPY_MAIL --E-mail, копия
+   , MSG.SUBJECT AS SUBJECT --Тема
+   , RCT.NAME AS REQUESTER_NAME --Заявитель
+   , (CASE
+       WHEN MSGB.ID_MESSAGE IS NOT NULL
+       THEN MSGB.MAIL_BODY
+       ELSE SUBSTR(TRIM(TRIM(chr(13) FROM trim(chr(10) from REGEXP_REPLACE(REGEXP_REPLACE(REPLACE(MSG.BODY,'<br>',chr(10)),'<style>.*</style>','',1, 0, 'nm'),'(\<(/?[^>]+)>)','')))),1,32766)
+      END) AS MAIL_TEXT   --Текст письма
+   --, MSGB.MAIL_BODY AS MAIL_TEXT --SUBSTR(TRIM(TRIM(chr(13) FROM trim(chr(10) from REGEXP_REPLACE(REGEXP_REPLACE(REPLACE(MSG.BODY,'<br>',chr(10)),'<style>.*</style>','',1, 0, 'nm'),'(\<(/?[^>]+)>)','')))),1,32766)  AS MAIL_TEXT   --Текст письма
+   , MSG.BODY  AS MAIL_BODY   --Текст письма (без обрезки тегов и по длине)
+   , MSG.SHORT_TEXT AS MAIL_SHORT_TEXT -- Первые несколько слов текста
+   , MSG.PREPARED_BODY AS MAIL_PREPARED_BODY -- Очищенный текст письма
+   , MST.NAME AS TYPE_MAIL -- Тип письма, на основании которого оформлено обращение
+   , US.LOGIN AS OPERATOR_LOGIN --Оператор
+   , (CASE
+       WHEN MSG_2.FID_MSG_TYPE IN (5,6) OR MSG_3.FID_MSG_TYPE IN (5,6)
+       THEN NVL(MSG_2.ID_MESSAGE, MSG_3.ID_MESSAGE)
+       ELSE NULL
+     END) AS SENT_ID_MESSAGE --ID ОТПРАВЛЕННОГО ПИСЬМА
+   , NVL(MAD_2.RECEIVER_MAIL,MAD_3.RECEIVER_MAIL) AS SENT_RECEIVER_MAIL --E-mail, кому
+   , NVL(MAD_2.COPY_MAIL,MAD_3.COPY_MAIL) AS SENT_COPY_MAIL --E-mail, копия
+   , (CASE
+       WHEN MSG_2.FID_MSG_TYPE IN (5,6) AND MSGB_2.ID_MESSAGE IS NOT NULL
+       THEN MSGB_2.MAIL_BODY-- SUBSTR(TRIM(TRIM(chr(13) FROM trim(chr(10) from REGEXP_REPLACE(REGEXP_REPLACE(REPLACE(MSG_2.BODY,'<br>',chr(10)),'<style>.*</style>','',1, 0, 'nm'),'(\<(/?[^>]+)>)','')))),1,32766)
+       WHEN MSG_3.FID_MSG_TYPE IN (5,6) AND MSGB_3.ID_MESSAGE IS NOT NULL
+       THEN MSGB_3.MAIL_BODY --SUBSTR(TRIM(TRIM(chr(13) FROM trim(chr(10) from REGEXP_REPLACE(REGEXP_REPLACE(REPLACE(MSG_3.BODY,'<br>',chr(10)),'<style>.*</style>','',1, 0, 'nm'),'(\<(/?[^>]+)>)','')))),1,32766)
+       WHEN MSG_2.FID_MSG_TYPE IN (5,6) AND MSG_2.ID_MESSAGE IS NOT NULL
+       THEN SUBSTR(TRIM(TRIM(chr(13) FROM trim(chr(10) from REGEXP_REPLACE(REGEXP_REPLACE(REPLACE(MSG_2.BODY,'<br>',chr(10)),'<style>.*</style>','',1, 0, 'nm'),'(\<(/?[^>]+)>)','')))),1,32766)
+       WHEN MSG_3.FID_MSG_TYPE IN (5,6) AND MSG_3.ID_MESSAGE IS NOT NULL
+       THEN SUBSTR(TRIM(TRIM(chr(13) FROM trim(chr(10) from REGEXP_REPLACE(REGEXP_REPLACE(REPLACE(MSG_3.BODY,'<br>',chr(10)),'<style>.*</style>','',1, 0, 'nm'),'(\<(/?[^>]+)>)','')))),1,32766)
+       ELSE NULL
+      END) AS SENT_MAIL_TEXT   --Текст письма
+
+   , (CASE
+       WHEN MSG_2.FID_MSG_TYPE IN (5,6) AND MSG_2.ID_MESSAGE IS NOT NULL
+       THEN MSG_2.BODY
+       WHEN MSG_3.FID_MSG_TYPE IN (5,6) AND MSG_3.ID_MESSAGE IS NOT NULL
+       THEN MSG_3.BODY
+       ELSE NULL
+      END) AS SENT_MAIL_BODY   --Текст письма (без обрезки тегов и по длине)
+
+   , (CASE
+       WHEN MSG_2.FID_MSG_TYPE IN (5,6) AND MSG_2.ID_MESSAGE IS NOT NULL
+       THEN MSG_2.SHORT_TEXT
+       WHEN MSG_3.FID_MSG_TYPE IN (5,6) AND MSG_3.ID_MESSAGE IS NOT NULL
+       THEN MSG_3.SHORT_TEXT
+       ELSE NULL
+      END) AS SENT_SHORT_TEXT   -- Первые несколько слов текста
+
+   , (CASE
+       WHEN MSG_2.FID_MSG_TYPE IN (5,6) AND MSG_2.ID_MESSAGE IS NOT NULL
+       THEN MSG_2.PREPARED_BODY
+       WHEN MSG_3.FID_MSG_TYPE IN (5,6) AND MSG_3.ID_MESSAGE IS NOT NULL
+       THEN MSG_3.PREPARED_BODY
+       ELSE NULL
+      END) AS SENT_PREPARED_BODY   -- Очищенный текст письма
+   , (CASE
+       WHEN MSG_2.FID_MSG_TYPE IN (5,6) OR MSG_3.FID_MSG_TYPE IN (5,6)
+       THEN NVL(MST_2.NAME, MST_3.NAME)
+     ELSE NULL
+     END) AS TYPE_SENT_MAIL -- Тип исходящего письма
+   , (CASE
+       WHEN ACL.START_CODE = 'sent-answer'
+       THEN WSB.SUBSTANCE_NAME
+       ELSE NULL
+     END) AS SEL_WIKI_SUBSTANCES --Выбранные шаблоны ответов
+   , (CASE
+     WHEN ACR_2.ID_RELATION IS NOT NULL
+      THEN 'ДА'
+     ELSE ''
+      END) AS REGISTRATION --Регистрация обращения
+
+    , TTS.TASK1                                        AS TASK1 --Номер заявки в Jira
+    , TTS.TASK2                                        AS TASK2 --Номер заявки в Jira
+    , TTS.TASK3                                        AS TASK3 --Номер заявки в Jira
+    , TTS.TASK4                                        AS TASK4 --Номер заявки в Jira
+    , TTS.TASK5                                        AS TASK5 --Номер заявки в Jira
+    , TTS.TASK6                                        AS TASK6 --Номер заявки в Jira
+    , TTS.TASK7                                        AS TASK7 --Номер заявки в Jira
+    , TTS.TASK8                                        AS TASK8 --Номер заявки в Jira
+    , TTS.TASK9                                        AS TASK9 --Номер заявки в Jira
+    , TTS.TASK10                                       AS TASK10 --Номер заявки в Jira
+    , ACT.COMPANY_TYPES AS COMPANY_TYPES --Полномочие организации
+    , '' AS TAG --Метка
+
+    , (CASE
+        WHEN OCR.FID_TICKET IS NOT NULL
+        THEN 'Да'
+        ELSE 'Нет'
+       END) AS OUT_CALL --Исходящий звонок пользователю
+    , OCR.CALL_RESULT_1 AS RESULT_FIRST_ATTEMPT --Результат 1й попытки
+    , OCR.CALL_RESULT_2 AS RESULT_SECOND_ATTEMPT --Результат 2й попытки
+    , OCR.CALL_RESULT_3 AS RESULT_THIRD_ATTEMPT --Результат 3й попытки
+    , OCR.NEXT_CALL_TIME AS RECALL_TIME --Дата и время перезвона
+
+  --  , '' AS OUT_CALL --Исходящий звонок пользователю
+  --  , '' AS RESULT_FIRST_ATTEMPT --Результат 1й попытки
+  --  , '' AS RESULT_SECOND_ATTEMPT --Результат 2й попытки
+  --  , '' AS RESULT_THIRD_ATTEMPT --Результат 3й попытки
+  --  , '' AS RECALL_TIME --Дата и время перезвона
+
+   , ACL.ID_LOG AS ID_LOG --ЛОГ
+   , LG.NEW_VALUE AS TICKET_VALUE
+   , TCT.ORDER_NUMBER AS ORDER_NUMBER --Номер заказа платежа
+   
+   , to_char(TCT.ISSUE_DATE, 'dd.mm.yyyy') AS ISSUE_DATE -- Дата воспроизведения
+   , TCT.TIMEZONE   -- Часовой пояс
+   , TCT.ISSUE_TIME -- Время воспроизведения
+
+  FROM
+   ACTIONS_LOGS_2 ACL
+  LEFT JOIN FIRST_MESSAGES FM
+   ON FM.ID_TICKET = ACL.LOG_ID
+  LEFT JOIN JIRA_INCOMING_ISSUES JII
+   ON JII.FID_MESSAGE = FM.FID_MESSAGE
+  LEFT JOIN ALL_MESSAGES ALM
+   ON ALM.ID_TICKET = ACL.LOG_ID
+  LEFT JOIN MAIL_MESSAGES MSG
+   ON MSG.ID_MESSAGE = FM.FID_MESSAGE
+/**/  LEFT JOIN MAIL_MESSAGES_BODY MSGB
+/**/   ON MSGB.ID_MESSAGE = MSG.ID_MESSAGE
+  LEFT JOIN MAIL_D_MSG_TYPES MST
+   ON MST.ID_MSG_TYPE = MSG.FID_MSG_TYPE
+  JOIN USER_ACTION_TYPES ACT_1
+   ON ACT_1.CODE = ACL.START_CODE
+  LEFT JOIN USER_ACTION_TYPES ACT_2
+   ON ACT_2.CODE = ACL.FINISH_CODE
+  LEFT JOIN MAIL_ADRESSES MAD
+   ON MAD.FID_MESSAGE = MSG.ID_MESSAGE
+  LEFT JOIN MAIL_D_REQUESTER_TYPES RCT
+   ON RCT.ID_REQUESTER_TYPE = MSG.FID_REQUESTER_TYPE
+  LEFT JOIN CIS.NC_USERS US --ОПЕРАТОРЫ
+   ON US.ID_USER = ACL.FID_USER
+  LEFT JOIN USER_ACTION_RELATIONS ACR
+   ON ACR.FID_ACTION = ACL.ID_ACTION AND ACR.RELATIONABLE_TYPE = 'MAIL_MESSAGES'
+  LEFT JOIN MAIL_MESSAGES MSG_2
+   ON MSG_2.ID_MESSAGE = ACR.RELATIONABLE_ID AND ACR.RELATIONABLE_TYPE = 'MAIL_MESSAGES'
+/**/  LEFT JOIN MAIL_MESSAGES_BODY MSGB_2
+/**/   ON MSGB_2.ID_MESSAGE = MSG_2.ID_MESSAGE
+  LEFT JOIN MAIL_D_MSG_TYPES MST_2
+   ON MST_2.ID_MSG_TYPE = MSG_2.FID_MSG_TYPE
+  LEFT JOIN MAIL_ADRESSES MAD_2
+   ON MAD_2.FID_MESSAGE = MSG_2.ID_MESSAGE
+  -------------------------
+  LEFT JOIN USER_ACTION_RELATIONS ACR_3 -- Для автоматических писем
+   ON ACR_3.FID_ACTION = ACL.PREV_ID_ACTION AND ACR_3.RELATIONABLE_TYPE = 'MAIL_MESSAGES'
+  LEFT JOIN MAIL_MESSAGES MSG_3
+   ON MSG_3.ID_MESSAGE = ACR_3.RELATIONABLE_ID AND ACR_3.RELATIONABLE_TYPE = 'MAIL_MESSAGES'
+/**/  LEFT JOIN MAIL_MESSAGES_BODY MSGB_3
+/**/   ON MSGB_3.ID_MESSAGE = MSG_3.ID_MESSAGE
+  LEFT JOIN MAIL_D_MSG_TYPES MST_3
+   ON MST_3.ID_MSG_TYPE = MSG_3.FID_MSG_TYPE
+  LEFT JOIN MAIL_ADRESSES MAD_3
+   ON MAD_3.FID_MESSAGE = MSG_2.ID_MESSAGE
+  -------------------------
+  LEFT JOIN USER_ACTION_RELATIONS ACR_2 --ЧТОБЫ ПОНЯТЬ БЫЛА ЛИ РЕГИСТРАЦИЯ ПРИ СОЗДАНИИ ОБРАЩЕНИЯ
+   ON ACR_2.RELATIONABLE_ID = ACL.PREV_ID_ACTION AND ACR_2.RELATIONABLE_TYPE = 'USER_ACTIONS_LOG'
+  LEFT JOIN ALL_TICKETS_TASKS TTS --НОМЕРА ЗАЯВОК В JIRA
+   ON TTS.FID_ACTION = ACL.ID_ACTION
+  LEFT JOIN ALL_COMPANY_TYPES ACT
+   ON ACT.ID_TICKET = ACL.LOG_ID
+  LEFT JOIN LOGS LG
+   ON LG.ID_LOG = ACL.ID_LOG
+  LEFT JOIN GET_WIKI_SUBSTANCES WSB
+   ON WSB.FID_ACTION = ACL.ID_ACTION AND ACL.START_CODE = 'sent-answer'
+  LEFT JOIN OUT_CALL_RESULTS OCR
+   ON OCR.FID_TICKET = ACL.LOG_ID
+  LEFT JOIN TICKETS TCT
+   ON TCT.ID_TICKET = ACL.LOG_ID
+ WHERE (TCT.COMPANY_OGRN = I_OGRN OR I_OGRN IS NULL)
+   AND (TCT.FID_COMPANY_REGION = I_REGION OR I_REGION IS NULL)
+
+   ORDER BY ACL.START_TIME DESC
+   ;
+
+   TYPE t_ticket_events IS TABLE OF cur_ticket_events%rowtype;
+
+  FUNCTION fnc_ticket_events
+  (
+        I_INIT_TIME TIMESTAMP
+      , I_FINISH_TIME TIMESTAMP
+      , I_LOGIN NUMBER := NULL
+      , I_TICKET NUMBER := NULL
+      , I_EMAIL VARCHAR2 := NULL
+      , I_OGRN VARCHAR2 := NULL
+      , I_REGION NUMBER := NULL
+
+  ) RETURN t_ticket_events pipelined;
+
+END PKG_ADMIN_REG_TICKET_EVENTS;
+/
+
+
+CREATE OR REPLACE PACKAGE BODY PKG_ADMIN_REG_TICKET_EVENTS AS
+
+
+--Этот пакет предназначен для отчетности,
+--которая выгружается в редактор.
+--ЗАЯВКА ZHKKH-761
+
+---------------------------------------------------------------
+--          ЖУРНАЛ СОБЫТИЙ ПО ОБРАЩЕНИЯМ                     --
+---------------------------------------------------------------
+
+    FUNCTION fnc_ticket_events
+(
+        I_INIT_TIME TIMESTAMP
+      , I_FINISH_TIME TIMESTAMP
+      , I_LOGIN NUMBER := NULL
+      , I_TICKET NUMBER := NULL
+      , I_EMAIL VARCHAR2 := NULL
+      , I_OGRN VARCHAR2 := NULL
+      , I_REGION NUMBER := NULL
+
+) RETURN t_ticket_events pipelined AS
+  BEGIN
+   IF (I_INIT_TIME IS NOT NULL OR I_FINISH_TIME IS NOT NULL OR I_LOGIN IS NOT NULL OR I_TICKET IS NOT NULL
+        OR I_EMAIL IS NOT NULL  OR I_OGRN IS NOT NULL OR I_REGION IS NOT NULL)
+    THEN
+
+       FOR L IN cur_ticket_events(I_INIT_TIME, I_FINISH_TIME, I_LOGIN, I_TICKET, I_EMAIL, I_OGRN ,I_REGION )
+        LOOP
+        PIPE ROW (L);
+       END LOOP;
+
+   END IF;
+  END fnc_ticket_events;
+
+
+END PKG_ADMIN_REG_TICKET_EVENTS;
+/
